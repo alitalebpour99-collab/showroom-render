@@ -1,0 +1,9 @@
+numpy
+opencv-python-headless
+librosa
+soundfile
+pillow
+arabic-reshaper
+python-bidi
+onnxruntime
+open-image-models

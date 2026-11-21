@@ -1,40 +1,36 @@
-name: detail-demo
+name: reels
 on:
   workflow_dispatch:
   push:
     paths: ["tools/**", ".github/workflows/detail-demo.yml"]
-concurrency: { group: detail-demo, cancel-in-progress: true }
+concurrency: { group: reels, cancel-in-progress: true }
 jobs:
   render:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix: { template: [detail, send, versus] }
     steps:
       - uses: actions/checkout@v4
       - name: System tools
         run: sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg >/dev/null && ffmpeg -version | head -1
       - uses: actions/setup-python@v5
-        with: { python-version: "3.11" }
+        with: { python-version: "3.11", cache: pip, cache-dependency-path: tools/requirements.txt }
       - name: Python deps
-        run: pip install -q numpy opencv-python-headless librosa soundfile pillow arabic-reshaper python-bidi onnxruntime open-image-models
+        run: pip install -q -r tools/requirements.txt
       - name: Fonts (Vazirmatn, OFL)
         run: |
           mkdir -p work/fonts
           for w in Light Medium Bold; do curl -sfL -o work/fonts/Vazirmatn-$w.ttf https://github.com/rastikerdar/vazirmatn/raw/master/fonts/ttf/Vazirmatn-$w.ttf; done
-          ls -la work/fonts
       - name: Inputs (encrypted - footage and Setavaz music stay private)
         env: { BUNDLE_KEY: "${{ secrets.BUNDLE_KEY }}" }
         run: |
           mkdir -p work/in
           openssl enc -d -aes-256-cbc -pbkdf2 -pass env:BUNDLE_KEY -in inputs/bundle.enc | tar xz -C work/in
-          ls -laR work/in
       - name: House LUT
-        run: python tools/make_lut.py work/golden-gallery.cube && cp work/golden-gallery.cube work/out-lut.cube
-      - name: Render
-        run: python tools/render_detail.py work
-      - name: Collect
-        run: |
-          cp work/golden-gallery.cube work/out/
-          rm -f work/out/video.mp4 work/out/audio.wav
-          ls -la work/out
+        run: python tools/make_lut.py work/golden-gallery.cube
+      - name: Render ${{ matrix.template }}
+        run: python tools/render.py work ${{ matrix.template }}
       - uses: actions/upload-artifact@v4
-        with: { name: detail-demo, path: work/out, retention-days: 14 }
+        with: { name: "${{ matrix.template }}", path: "work/out/${{ matrix.template }}", retention-days: 14 }
