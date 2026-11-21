@@ -365,7 +365,8 @@ def detect(frames, edges_y=()):
             bw, bh = b.x2 - b.x1, b.y2 - b.y1
             ar = bw / max(1, bh)
             edge = b.x1 <= 3 or b.x2 >= w - 3 or b.y2 >= h - 3 or any(abs(b.y1 - e) < 5 or abs(b.y2 - e) < 5 for e in edges_y)
-            ok_shape = (1.6 <= ar <= 7.5) or (1.2 <= ar < 1.6 and d.confidence >= 0.70) or (edge and d.confidence >= 0.85)
+            # angled plates (3/4 views) give squarish boxes; the one false positive seen (a P button) scored <= 0.79
+            ok_shape = (1.6 <= ar <= 7.5) or (1.2 <= ar < 1.6 and d.confidence >= 0.70) or (ar >= 0.75 and d.confidence >= 0.88) or (edge and d.confidence >= 0.85)
             if d.confidence < 0.45 or not ok_shape or bw < 24:
                 REJECT.append(dict(conf=round(float(d.confidence), 2), ar=round(ar, 2), w=int(bw)))
                 continue
@@ -451,6 +452,25 @@ def put_plates(f, boxes, edges_y=()):
             continue
         px, py = int(bw * 0.10) + 3, int(bh * 0.22) + 3
         X1, Y1, X2, Y2 = x1 - px, y1 - py, x2 + px, y2 + py
+        edge_box = x1 <= 4 or x2 >= w - 4
+        if not edge_box and bw / max(1, bh) < 1.6:
+            # angled plate: soften the whole plate area, then a correctly proportioned plate across its width
+            bx1, by1, bx2, by2 = max(0, x1 - 6), max(0, y1 - 6), min(w, x2 + 6), min(h, y2 + 6)
+            for e in edges_y:
+                if by1 < e <= y1:
+                    by1 = e
+                if y2 <= e < by2:
+                    by2 = e
+            if bx2 > bx1 + 4 and by2 > by1 + 4:
+                if out is f:
+                    out = f.copy()
+                k = max(15, (max(bx2 - bx1, by2 - by1) // 3) | 1)
+                out[by1:by2, bx1:bx2] = cv2.GaussianBlur(out[by1:by2, bx1:bx2], (k, k), 0)
+            cxm, cym = (x1 + x2) / 2, (y1 + y2) / 2
+            aw = bw * 1.08
+            ah = aw / PLATE_AR * 1.1
+            X1, X2 = int(cxm - aw / 2), int(cxm + aw / 2)
+            Y1, Y2 = int(cym - ah / 2), int(cym + ah / 2)
         # edge-clipped plate: rebuild the full plate size off-frame so the art keeps its aspect
         full_w = int((Y2 - Y1) * PLATE_AR * 0.92)
         if (X2 - X1) < full_w * 0.85:
