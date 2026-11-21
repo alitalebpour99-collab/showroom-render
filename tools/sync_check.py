@@ -2,8 +2,8 @@
 
 usage: python sync_check.py <reel.mp4> <render-log.json> <out_dir>
 
-- beats: librosa on the reel's own audio (music + sound design), fitted to a straight line with the bpm from the log;
-- cuts: frame-difference peaks of the decoded video (small grey frames), so hard cuts, whips and flashes all count;
+- beats: comb fit of the kick band of the reel's own audio (music + sound design), tempo searched +-5 % of the plan;
+- cuts: grey-histogram + coarse-layout change peaks (beat zoom pulses do not count, whips and flashes do);
 - every cut gets its distance to the nearest beat / eighth; the drop must carry a cut;
 - writes sync-check-<t>.json and sync-check-<t>.png (waveform, beats, bar lines in gold, cuts in red).
 """
@@ -16,49 +16,59 @@ import cv2
 import librosa
 import numpy as np
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import beatgrid  # noqa: E402
+
 mp4, logf, out = sys.argv[1], sys.argv[2], sys.argv[3]
 log = json.load(open(logf, encoding="utf-8"))
 T = log["template"]
 period = log["music"]["period"]
 FPS = 30
 
-y, sr = librosa.load(mp4, sr=22050, mono=True)
+y, sr = librosa.load(mp4, sr=beatgrid.SRA, mono=True)
 dur = len(y) / sr
-env = librosa.onset.onset_strength(y=y, sr=sr)
-_, bfr = librosa.beat.beat_track(onset_envelope=env, sr=sr, start_bpm=60 / period, tightness=300)
-bt = librosa.frames_to_time(bfr, sr=sr)
-idx = np.round((bt - bt[0]) / period)
-b1, b0 = np.polyfit(idx, bt, 1) if len(bt) > 3 else (period, 0.0)
-phase = b0 % b1
+on, hop_s = beatgrid.kick_onsets(y.astype(np.float64), sr)
+bpm0 = 60 / period
+bpm_m, b1, phase, contrast = beatgrid.comb(on, hop_s, 0.0, dur - 0.05, bpm0 * 0.95, bpm0 * 1.05, step=0.01, ph_step=hop_s)
+while phase - b1 > -1e-9:
+    phase -= b1
+phase += b1
 beats = np.arange(phase, dur + 1e-6, b1)
-# downbeats from the plan (the reel starts on a downbeat by construction); report the measured phase offset
 eighths = np.sort(np.concatenate([beats, beats[:-1] + b1 / 2]))
 
 raw = subprocess.run(["ffmpeg", "-v", "error", "-i", mp4, "-vf", "scale=96:170,format=gray", "-f", "rawvideo", "-"],
                      capture_output=True, check=True).stdout
 fr = np.frombuffer(raw, np.uint8).reshape(-1, 170, 96).astype(np.float32)
-d = np.abs(np.diff(fr, axis=0)).mean(axis=(1, 2))
-med = float(np.median(d)) + 1e-3
+hist = np.stack([np.histogram(f, bins=32, range=(0, 256))[0] for f in fr]).astype(np.float32) / (170 * 96)
+small = np.stack([cv2.resize(f, (12, 21), interpolation=cv2.INTER_AREA) for f in fr])
+dh = 0.5 * np.abs(np.diff(hist, axis=0)).sum(1)
+dl = np.abs(np.diff(small, axis=0)).mean(axis=(1, 2))
+score = np.maximum(dh / 0.18, dl / 16.0)
 cuts = []
-for i in range(1, len(d) - 1):
-    if d[i] >= d[i - 1] and d[i] >= d[i + 1] and d[i] > max(6.0, 3.2 * med):
+for i in range(len(score)):
+    if score[i] >= 1.0 and score[i] == score[max(0, i - 2):i + 3].max():
         t = (i + 1) / FPS  # the new picture starts at frame i+1
-        if not cuts or t - cuts[-1] > 0.15:
+        if not cuts or t - cuts[-1] > 0.2:
             cuts.append(t)
-plan = [c["t0"] for c in log["cuts"] if c["t0"] > 0.01]
+pc = [c for c in log["cuts"] if c["t0"] > 0.01]
+plan = [c["t0"] for c in pc]
+loop_from = dur - 6 / FPS - 0.05  # the closing dissolve into frame 0 is not a cut
 rows = []
 for t in cuts:
     e = float(np.min(np.abs(eighths - t)))
-    p = min(plan, key=lambda x: abs(x - t)) if plan else None
-    rows.append(dict(t=round(t, 3), beat_err_ms=round(1000 * e, 1), plan_cut=round(p, 3) if p is not None else None,
-                     plan_err_ms=round(1000 * abs(p - t), 1) if p is not None else None))
-missed = [round(p, 3) for p in plan if not any(abs(p - t) < 0.08 for t in cuts)]
+    c = min(pc, key=lambda x: abs(x["t0"] - t)) if pc else None
+    kind = "loop" if t >= loop_from else ("whip" if c and c.get("tr") == "whip" and abs(c["t0"] - t) < 0.15 else "cut")
+    rows.append(dict(t=round(t, 3), kind=kind, beat_err_ms=round(1000 * e, 1), plan_cut=round(c["t0"], 3) if c else None,
+                     plan_err_ms=round(1000 * abs(c["t0"] - t), 1) if c else None))
+hard = [r["beat_err_ms"] for r in rows if r["kind"] == "cut"]
+missed = [round(p["t0"], 3) for p in pc if not any(abs(p["t0"] - t) < (0.15 if p.get("tr") == "whip" else 0.08) for t in cuts)]
 drop = log["sync_plan"]["drop_t"]
-res = dict(template=T, bpm_measured=round(60 / b1, 2), bpm_plan=log["music"]["bpm"],
+res = dict(template=T, bpm_measured=round(60 / b1, 2), grid_contrast=round(contrast, 2), bpm_plan=log["music"]["bpm"],
            beat_phase_ms=round(1000 * (phase if phase < b1 / 2 else phase - b1), 1),
            cuts_detected=len(cuts), cuts_planned=len(plan), planned_cuts_not_seen=missed,
-           max_beat_err_ms=max([r["beat_err_ms"] for r in rows] or [0]),
-           mean_beat_err_ms=round(float(np.mean([r["beat_err_ms"] for r in rows] or [0])), 1),
+           max_beat_err_ms=max(hard or [0]),
+           mean_beat_err_ms=round(float(np.mean(hard or [0])), 1),
+           whip_onsets_ms=[r["beat_err_ms"] for r in rows if r["kind"] == "whip"],
            drop_t=drop, drop_has_cut=any(abs(t - drop) < 0.05 for t in cuts), cuts=rows,
            loop=dict(first_last_frame_diff=round(float(np.abs(fr[0] - fr[-1]).mean()), 1)))
 os.makedirs(out, exist_ok=True)

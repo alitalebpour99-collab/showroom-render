@@ -21,6 +21,9 @@ import cv2
 import librosa
 import numpy as np
 import soundfile as sf
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import beatgrid  # noqa: E402
 from PIL import Image, ImageDraw, ImageFilter, ImageFont, features
 
 import arabic_reshaper
@@ -96,8 +99,8 @@ SHOTS = {
 # ============================================================ music + beat grid
 # Every Reel is built on the bar grid of its own track (since 21 Nov 2026):
 #   - music/showroom.json names the track per template (+ optional drop hint, bpm hint);
-#   - beats are tracked with librosa, then fitted to a straight line (Lyria tracks keep a steady tempo), so every
-#     cut sits on an exact beat time, not on a jittery detection;
+#   - tempo and phase come from a comb fit of the kick band around the drop (tools/beatgrid.py), so every cut sits on
+#     an exact beat time (librosa beat_track quantises tempo, and generated tracks are not at the tempo they were asked);
 #   - the drop = the beat where the low end (< 150 Hz) jumps most (bars after vs bars before), snapped near the hint;
 #     downbeats are counted from the drop, so bar lines are musical;
 #   - the window starts DROP_BAR bars before the drop and lasts BARS whole bars: the reveal hits the drop, the end
@@ -110,67 +113,14 @@ def load_music_cfg():
     return {}
 
 
-def low_band_env(y, sr, hop=512):
-    S = np.abs(librosa.stft(y, n_fft=2048, hop_length=hop))
-    fr = librosa.fft_frequencies(sr=sr, n_fft=2048)
-    low = S[fr < 150].sum(0)
-    t = librosa.frames_to_time(np.arange(len(low)), sr=sr, hop_length=hop)
-    return low, t
-
-
 def beat_grid(path, bpm_hint=None, drop_hint=None, drop_bar=2, bars=5):
-    y, sr = librosa.load(path, sr=22050, mono=True)
-    dur = len(y) / sr
-    env = librosa.onset.onset_strength(y=y, sr=sr)
-    kw = dict(start_bpm=float(bpm_hint), tightness=300) if bpm_hint else {}
-    tempo, bfr = librosa.beat.beat_track(onset_envelope=env, sr=sr, **kw)
-    bt = librosa.frames_to_time(bfr, sr=sr)
-    period = float(np.median(np.diff(bt)))
-    if bpm_hint:  # fix half/double tempo against the brief
-        exp = 60.0 / float(bpm_hint)
-        for f in (0.5, 2.0, 1.0):
-            if abs(period * f - exp) / exp < 0.08:
-                period *= f
-                break
-    # straight-line fit of the beat times (index -> time), robust to a few misses
-    idx = np.round((bt - bt[0]) / period)
-    A = np.vstack([idx, np.ones_like(idx)]).T
-    for _ in range(3):
-        (b1, b0), *_ = np.linalg.lstsq(A, bt, rcond=None)
-        res = np.abs(A @ np.array([b1, b0]) - bt)
-        keep = res < max(0.03, np.percentile(res, 80))
-        A, bt, idx = A[keep], bt[keep], idx[keep]
-    period, phase = float(b1), float(b0)
-    while phase - period > 0:
-        phase -= period
-    grid = np.arange(phase, dur, period)
-    low, lt = low_band_env(y, sr)
-    lowi = np.interp(grid, lt, low)
-
-    def span(t0, t1):
-        m = (lt >= t0) & (lt < t1)
-        return float(low[m].mean()) if m.any() else 0.0
-
-    best = None
-    bar = 4 * period
-    for i, t in enumerate(grid):
-        if t - drop_bar * bar < 0.3 or t + (bars - drop_bar) * bar > dur - 0.5 or t > 75:
-            continue
-        r = (span(t, t + 2 * bar) + 1e-6) / (span(t - 2 * bar, t) + 1e-6)
-        r *= 1.0 + 0.5 * (span(t, t + 0.15) / (span(t - 0.3, t - 0.05) + 1e-6) > 1.5)  # a hard hit right on the beat
-        if drop_hint is not None:
-            r *= math.exp(-((t - float(drop_hint)) / (1.5 * bar)) ** 2)
-        if best is None or r > best[0]:
-            best = (r, i, t)
-    if best is None:
-        raise SystemExit(f"no usable drop in {path}")
-    _, di, drop = best
-    i0 = di - drop_bar * 4
-    i1 = i0 + bars * 4
-    rel = [float(grid[k] - grid[i0]) for k in range(i0, i1 + 1)]
-    info = dict(file=os.path.basename(path), bpm=round(60 / period, 2), period=round(period, 4), drop=round(float(drop), 3),
-                drop_ratio=round(float(best[0]), 2), start=round(float(grid[i0]), 3), bars=bars, drop_bar=drop_bar,
-                length=round(rel[-1], 3), drop_low_jump=round(float(lowi[di] / (lowi[max(0, di - 2)] + 1e-6)), 2))
+    """bar grid of the track (tools/beatgrid.py: kick-band comb fit around the drop, not librosa's quantised tempo)."""
+    y, sr = librosa.load(path, sr=beatgrid.SRA, mono=True)
+    rel, info = beatgrid.grid_for(y.astype(np.float64), sr, bpm_hint, drop_hint, drop_bar, bars)
+    info = {k: (float(v) if isinstance(v, (np.floating,)) else v) for k, v in info.items()}
+    info["file"] = os.path.basename(path)
+    if info["contrast"] < 3.5:
+        print("WARNING: weak beat grid (contrast %.2f); give a bpm and drop hint in showroom.json" % info["contrast"])
     print("music", info)
     return info, rel
 
@@ -205,7 +155,7 @@ TEMPLATES = {
 def template_specs():
     if TEMPLATE == "detail":
         # «حدس بزن کدوم ماشینه؟»: G80 details on the build without a name, the whole car on the drop.
-        pre = [("g80_seat", 2, "cut"), ("g80_console", 1, "cut"), ("g80_wheel", 1, "cut"), ("g80_back", 1, "cut"),
+        pre = [("g80_seat", 2, "cut"), ("g80_console", 2, "cut"), ("g80_wheel", 1, "cut"),
                ("g80_light", 1, "whip"), ("g80_badge", 1, "cut"), ("g80_script", 1, "whip")]
         post = [("g80_sign", 4, "flash"), ("g80_front", 2, "whip"), ("g80_rear34", 1, "cut"), ("g80_rear", 1, "cut")]
         out = [dict(seg=seg(n, label=None, sweep=False), beats=b, tr=t) for n, b, t in pre]
@@ -731,7 +681,7 @@ def split_layers():
 
     def tag(text, y):
         t = Image.fromarray(np.zeros((H, W, 4), np.uint8), "RGBA")
-        t = Image.alpha_composite(t, soft_band(0, y - 24, 760, 100, 160))
+        t = Image.alpha_composite(t, soft_band(0, y - 30, 1000, 112, 200))
         dd = ImageDraw.Draw(t)
         spaced(dd, (60, y), text, font("Light", 38), IVORY + (255,), 6)
         return np.array(t)
@@ -860,7 +810,7 @@ def whip(f, u, direction=1):
         return f
     sh = int(direction * u * W * 0.22)
     M = np.float32([[1, 0, sh], [0, 1, 0]])
-    g = cv2.warpAffine(f, M, (W, H), borderMode=cv2.BORDER_REFLECT)
+    g = cv2.warpAffine(f, M, (W, H), borderMode=cv2.BORDER_REPLICATE)
     L = max(3, int(90 * u)) | 1
     return cv2.blur(g, (L, 1))
 
