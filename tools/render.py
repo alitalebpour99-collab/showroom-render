@@ -440,6 +440,61 @@ PLATE_ART = None
 PLATE_AR = 1040 / 228
 
 
+_SLOPES = []
+
+
+def plate_slope(f, box):
+    """dominant slope of near-horizontal edges inside the plate box (plate borders, text rows)."""
+    x1, y1, x2, y2 = box
+    reg = cv2.cvtColor(f[max(0, y1):y2, max(0, x1):x2], cv2.COLOR_BGR2GRAY).astype(np.float32)
+    if reg.size < 100:
+        return 0.0
+    gx = cv2.Sobel(reg, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(reg, cv2.CV_32F, 0, 1, ksize=3)
+    sxx, syy, sxy = float((gx * gx).sum()), float((gy * gy).sum()), float((gx * gy).sum())
+    theta = 0.5 * math.atan2(2 * sxy, sxx - syy)  # gradient direction
+    edge = theta + math.pi / 2  # edge direction
+    m = math.tan(edge) if abs(math.cos(edge)) > 0.3 else 0.0
+    m = float(np.clip(m, -0.6, 0.6))
+    cx = (x1 + x2) / 2
+    # temporal smoothing with the slope of the nearest recent plate
+    for e in _SLOPES:
+        if abs(e[0] - cx) < 90:
+            e[1] = 0.8 * e[1] + 0.2 * m
+            e[0] = cx
+            return e[1]
+    _SLOPES.append([cx, m])
+    return m
+
+
+def warp_plate(out, box, src):
+    global PLATE_ART
+    x1, y1, x2, y2 = box
+    h, w = out.shape[:2]
+    bw = x2 - x1
+    m = plate_slope(src, box)
+    cxm, cym = (x1 + x2) / 2, (y1 + y2) / 2
+    hw = bw * 0.56
+    hh = bw / PLATE_AR * 0.62
+    pts = np.float32([[cxm - hw, cym - m * hw - hh], [cxm + hw, cym + m * hw - hh],
+                      [cxm + hw, cym + m * hw + hh], [cxm - hw, cym - m * hw + hh]])
+    ah, aw = PLATE_ART.shape[:2]
+    M = cv2.getPerspectiveTransform(np.float32([[0, 0], [aw, 0], [aw, ah], [0, ah]]), pts)
+    bx1, by1 = int(max(0, pts[:, 0].min() - 2)), int(max(0, pts[:, 1].min() - 2))
+    bx2, by2 = int(min(w, pts[:, 0].max() + 2)), int(min(h, pts[:, 1].max() + 2))
+    if bx2 <= bx1 or by2 <= by1:
+        return out
+    T = np.float32([[1, 0, -bx1], [0, 1, -by1], [0, 0, 1]]) @ M
+    warped = cv2.warpPerspective(PLATE_ART, T, (bx2 - bx1, by2 - by1), flags=cv2.INTER_LINEAR, borderValue=(0, 0, 0, 0))
+    a = warped[..., 3:4].astype(np.float32) / 255.0
+    rgb = warped[..., :3][..., ::-1].astype(np.float32)
+    reg = out[by1:by2, bx1:bx2].astype(np.float32)
+    sc = np.clip(reg.mean() / 170.0, 0.65, 1.05)
+    out = out.copy() if out is src else out
+    out[by1:by2, bx1:bx2] = np.clip(reg * (1 - a) + rgb * sc * a, 0, 255).astype(np.uint8)
+    return out
+
+
 def put_plates(f, boxes, edges_y=()):
     global PLATE_ART
     if PLATE_ART is None:
@@ -464,13 +519,10 @@ def put_plates(f, boxes, edges_y=()):
             if bx2 > bx1 + 4 and by2 > by1 + 4:
                 if out is f:
                     out = f.copy()
-                k = max(15, (max(bx2 - bx1, by2 - by1) // 3) | 1)
+                k = max(11, (max(bx2 - bx1, by2 - by1) // 5) | 1)
                 out[by1:by2, bx1:bx2] = cv2.GaussianBlur(out[by1:by2, bx1:bx2], (k, k), 0)
-            cxm, cym = (x1 + x2) / 2, (y1 + y2) / 2
-            aw = bw * 1.08
-            ah = aw / PLATE_AR * 1.1
-            X1, X2 = int(cxm - aw / 2), int(cxm + aw / 2)
-            Y1, Y2 = int(cym - ah / 2), int(cym + ah / 2)
+            out = warp_plate(out, (x1, y1, x2, y2), f)
+            continue
         # edge-clipped plate: rebuild the full plate size off-frame so the art keeps its aspect
         full_w = int((Y2 - Y1) * PLATE_AR * 0.92)
         if (X2 - X1) < full_w * 0.85:
