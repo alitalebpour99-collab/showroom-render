@@ -30,7 +30,9 @@ dur = len(y) / sr
 on, hop_s = beatgrid.kick_onsets(y.astype(np.float64), sr)
 bpm0 = 60 / period
 bpm_m, b1, phase, contrast = beatgrid.comb(on, hop_s, 0.0, dur - 0.05, bpm0 * 0.95, bpm0 * 1.05, step=0.01, ph_step=hop_s)
-phase = phase % b1  # first beat at or after 0
+phase = phase % b1
+if phase > b1 / 2:  # a beat just before 0 is the beat at 0
+    phase -= b1
 beats = np.arange(phase, dur + 1e-6, b1)
 eighths = np.sort(np.concatenate([beats, beats[:-1] + b1 / 2]))
 
@@ -62,7 +64,7 @@ hard = [r["beat_err_ms"] for r in rows if r["kind"] == "cut"]
 missed = [round(p["t0"], 3) for p in pc if not any(abs(p["t0"] - t) < (0.15 if p.get("tr") == "whip" else 0.08) for t in cuts)]
 drop = log["sync_plan"]["drop_t"]
 res = dict(template=T, bpm_measured=round(60 / b1, 2), grid_contrast=round(contrast, 2), bpm_plan=log["music"]["bpm"],
-           beat_phase_ms=round(1000 * (phase if phase < b1 / 2 else phase - b1), 1),
+           beat_phase_ms=round(1000 * phase, 1),
            cuts_detected=len(cuts), cuts_planned=len(plan), planned_cuts_not_seen=missed,
            max_beat_err_ms=max(hard or [0]),
            mean_beat_err_ms=round(float(np.mean(hard or [0])), 1),
