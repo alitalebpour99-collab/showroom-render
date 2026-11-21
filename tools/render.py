@@ -57,14 +57,16 @@ def font(name, size):
 
 
 # ============================================================ shots
-def S(src, a, b, group=None, label=None, sweep=False, sky=False, ramp=False, cy=0.5):
-    return dict(src=src, a=a, b=b, group=group, label=label, sweep=sweep, sky=sky, ramp=ramp, cy=cy)
+def S(src, a, b, group=None, label=None, sweep=False, sky=False, ramp=False, cy=0.5, zoom=1.0, px=0.5, py=0.5):
+    return dict(src=src, a=a, b=b, group=group, label=label, sweep=sweep, sky=sky, ramp=ramp, cy=cy, zoom=zoom, px=px, py=py)
 
 
 SHOTS = {
     "c300_grille": S("B", 0.20, 2.85, "c300", "MERCEDES-BENZ  C 300", sweep=True, sky=True, ramp=True, cy=0.55),
     "c300_front_sign": S("B", 2.95, 4.28, "c300", "MERCEDES-BENZ  C 300", sky=True, cy=0.72),
-    "c300_rear": S("B", 4.38, 6.15, "c300", "MERCEDES-BENZ  C 300", sky=True, cy=0.52),
+    "c300_rear": S("B", 4.38, 6.15, "c300", "MERCEDES-BENZ  C 300", sky=True, cy=0.52, zoom=1.12, px=0.0),
+    "c300_rear_a": S("B", 4.38, 5.25, "c300", "MERCEDES-BENZ  C 300", sky=True, cy=0.52, zoom=1.12, px=0.0),
+    "c300_rear_b": S("B", 5.25, 6.15, "c300", "MERCEDES-BENZ  C 300", sky=True, cy=0.52, zoom=1.12, px=0.0),
     "newc_sign": S("C", 0.05, 1.00, "newc", "MERCEDES-BENZ  C-CLASS", sky=True, cy=0.62),
     "newc_hero": S("C", 1.08, 2.10, "newc", "MERCEDES-BENZ  C-CLASS", sweep=True, sky=True, ramp=True, cy=0.62),
     "newc_wheel": S("A", 11.42, 11.76, "newc", None, cy=0.6),
@@ -194,18 +196,17 @@ def template_specs():
         card = dict(kind="card", group="card", t0=0, t1=0, lines=SEND_LINES)
         names = [("c300_grille", 3), ("c300_rear", 2), ("eclass_front", 1), ("amg_rear", 2), ("newc_wheel", 1),
                  ("newc_sign", 2), ("newc_hero", 4)]
-        return [dict(seg=card, units=4)] + [dict(seg=seg(n), units=u) for n, u in names]
+        return [dict(seg=card, units=3)] + [dict(seg=seg(n), units=u) for n, u in names]
     if TEMPLATE == "versus":
-        title = dict(kind="split", group="vs", top=seg("c300_front_sign"), bot=seg("g80_sign"), round=None, title=True)
         rounds = [
-            ("جلو", "c300_front_sign", "g80_front"),
-            ("جلوپنجره", "c300_grille", "g80_badge"),
-            ("عقب", "c300_rear", "g80_rear"),
+            ("جلو", "c300_front_sign", "g80_sign", 6),
+            ("جلوپنجره", "c300_grille", "g80_badge", 4),
+            ("عقب", "c300_rear_a", "g80_rear", 4),
         ]
-        specs = [dict(seg=title, units=3)]
-        for r, a, b in rounds:
-            specs.append(dict(seg=dict(kind="split", group="vs", top=seg(a), bot=seg(b), round=r), units=4))
-        specs.append(dict(seg=dict(kind="split", group="vs", top=seg("newc_hero"), bot=seg("g80_rear34"),
+        specs = []
+        for i, (r, a, b, u) in enumerate(rounds):
+            specs.append(dict(seg=dict(kind="split", group="vs", top=seg(a), bot=seg(b), round=r, title=(i == 0)), units=u))
+        specs.append(dict(seg=dict(kind="split", group="vs", top=seg("c300_rear_b"), bot=seg("g80_rear34"),
                                    round=None, ask=True), units=3))
         return specs
     raise SystemExit("unknown template " + TEMPLATE)
@@ -217,12 +218,14 @@ _cache = {}
 
 
 def decode(shot):
-    key = (shot["src"], shot["a"], shot["b"])
+    key = (shot["src"], shot["a"], shot["b"], shot.get("zoom", 1.0), shot.get("px", 0.5))
     if key in _cache:
         return _cache[key]
     src = os.path.join(IN, SRC[shot["src"]])
     dur = shot["b"] - shot["a"]
-    vf = f"lut3d={LUT},scale={W}:{H}:flags=lanczos,format=bgr24"
+    z = shot.get("zoom", 1.0)
+    crop = f"crop=iw/{z}:ih/{z}:(iw-iw/{z})*{shot.get('px', 0.5)}:(ih-ih/{z})*{shot.get('py', 0.5)}," if z > 1.001 else ""
+    vf = f"{crop}lut3d={LUT},scale={W}:{H}:flags=lanczos,format=bgr24"
     cmd = ["ffmpeg", "-loglevel", "error", "-ss", f"{shot['a']:.3f}", "-t", f"{dur:.3f}", "-i", src,
            "-vf", vf, "-f", "rawvideo", "-pix_fmt", "bgr24", "-"]
     raw = subprocess.run(cmd, capture_output=True, check=True).stdout
@@ -362,7 +365,7 @@ def detect(frames, edges_y=()):
             bw, bh = b.x2 - b.x1, b.y2 - b.y1
             ar = bw / max(1, bh)
             edge = b.x1 <= 3 or b.x2 >= w - 3 or b.y2 >= h - 3 or any(abs(b.y1 - e) < 5 or abs(b.y2 - e) < 5 for e in edges_y)
-            ok_shape = (1.6 <= ar <= 7.5) or (edge and d.confidence >= 0.85)
+            ok_shape = (1.6 <= ar <= 7.5) or (1.2 <= ar < 1.6 and d.confidence >= 0.70) or (edge and d.confidence >= 0.85)
             if d.confidence < 0.45 or not ok_shape or bw < 24:
                 REJECT.append(dict(conf=round(float(d.confidence), 2), ar=round(ar, 2), w=int(bw)))
                 continue
@@ -528,7 +531,7 @@ def watermark_layer():
 def badge_layer():
     im = Image.new("RGBA", (W, H), (0, 0, 0, 0))
     d = ImageDraw.Draw(im)
-    x0, y0, bw, bh = 84, int(H * 0.72), 520, 78
+    x0, y0, bw, bh = 84, int(H * 0.215), 520, 78
     d.rounded_rectangle([x0, y0, x0 + bw, y0 + bh], radius=39, fill=(14, 12, 10, 185), outline=GOLD + (230,), width=2)
     cx, cy = x0 + 42, y0 + bh // 2
     d.ellipse([cx - 16, cy - 13, cx, cy + 3], fill=GOLD + (255,))
@@ -744,8 +747,8 @@ def main():
         gdur[run] = gdur.get(run, 0) + (p["t1"] - p["t0"])
         if run not in gstart:
             gstart[run] = p["t0"]
-            if p.get("label"):
-                labels[run] = label_layer(p["label"])
+        if run not in labels and p.get("label"):
+            labels[run] = label_layer(p["label"])
         if g not in gstart:
             gstart[g] = p["t0"]
     split_base, tag_top, tag_bot = split_layers()
@@ -806,10 +809,9 @@ def main():
             sweeps.append(st)
             if not is_end:
                 gpt = glint_point(frames[int(n * 0.6)], [b for bb in boxes for b in bb])
+        rl_title = pill_layer("این یا این؟", big=True) if (kind == "split" and p.get("title")) else None
         if kind == "split" and p.get("round"):
             rl = pill_layer(p["round"])
-        elif kind == "split" and p.get("title"):
-            rl = pill_layer("این یا این؟", big=True)
         elif kind == "split" and p.get("ask"):
             rl = pill_layer("تو کدومو برمی‌داری؟ کامنت کن", big=False)
         else:
@@ -834,8 +836,11 @@ def main():
                 f = comp(f, split_base)
                 f = comp(f, tag_top, min(1.0, (t - gstart["vs"]) / 0.2))
                 f = comp(f, tag_bot, min(1.0, (t - gstart["vs"]) / 0.2))
-                if rl is not None:
-                    f = comp(f, rl, min(1.0, k / 4))
+                if rl_title is not None and k < n * 0.5:
+                    f = comp(f, rl_title, min(1.0, k / 4))
+                elif rl is not None:
+                    k0 = int(n * 0.5) if rl_title is not None else 0
+                    f = comp(f, rl, min(1.0, (k - k0) / 4))
                 f = comp(f, wm)
             elif kind == "shot":
                 f = comp(f, wm)
