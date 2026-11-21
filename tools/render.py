@@ -42,6 +42,9 @@ os.makedirs(OUT, exist_ok=True)
 # public contact from the page bio (instagram.com/shahrak_talebpour, 21 Nov 2026)
 PHONE = "013-4213 4343"
 HANDLE = "@shahrak_talebpour"
+# page setting (owner 21 Nov 2026): real plates stay visible, like the showroom's own page.
+# "branded" brings back the tracked plate graphic.
+PLATES = os.environ.get("PLATES", "visible")
 GOLD = (214, 172, 84)
 IVORY = (246, 236, 211)
 CREAM = (243, 233, 210)
@@ -199,7 +202,7 @@ def template_specs():
         return [dict(seg=card, units=3)] + [dict(seg=seg(n), units=u) for n, u in names]
     if TEMPLATE == "versus":
         rounds = [
-            ("جلو", "c300_front_sign", "g80_sign", 6),
+            ("جلو", "c300_front_sign", "g80_sign", 5),
             ("جلوپنجره", "c300_grille", "g80_badge", 4),
             ("عقب", "c300_rear_a", "g80_rear", 4),
         ]
@@ -223,7 +226,7 @@ def decode(shot):
         return _cache[key]
     src = os.path.join(IN, SRC[shot["src"]])
     dur = shot["b"] - shot["a"]
-    z = shot.get("zoom", 1.0)
+    z = shot.get("zoom", 1.0) if PLATES != "visible" else 1.0
     crop = f"crop=iw/{z}:ih/{z}:(iw-iw/{z})*{shot.get('px', 0.5)}:(ih-ih/{z})*{shot.get('py', 0.5)}," if z > 1.001 else ""
     vf = f"{crop}lut3d={LUT},scale={W}:{H}:flags=lanczos,format=bgr24"
     cmd = ["ffmpeg", "-loglevel", "error", "-ss", f"{shot['a']:.3f}", "-t", f"{dur:.3f}", "-i", src,
@@ -356,6 +359,8 @@ def detector():
 
 
 def detect(frames, edges_y=()):
+    if PLATES == "visible":
+        return [[] for _ in frames]
     res = []
     for f in frames:
         h, w = f.shape[:2]
@@ -841,9 +846,14 @@ def main():
         if kind == "card":
             layers, deco = card_layers(p["lines"])
             per = n / (len(layers) + 0.6)
+            nxt = plan[si + 1] if si + 1 < len(plan) else SHOTS["c300_grille"]
+            bgsrc = decode(nxt)
             frames = []
             for k in range(n):
-                f = np.full((H, W, 3), (14, 12, 12), np.uint8)
+                bf = bgsrc[min(len(bgsrc) - 1, k // 3)]
+                bf = cv2.GaussianBlur(cv2.resize(bf, (W // 4, H // 4)), (0, 0), 6)
+                bf = cv2.resize(bf, (W, H), interpolation=cv2.INTER_LINEAR)
+                f = (bf.astype(np.float32) * 0.28 + np.array([12, 10, 10], np.float32)).clip(0, 255).astype(np.uint8)
                 f = comp(f, wm)
                 f = comp(f, deco)
                 for li, L in enumerate(layers):
@@ -933,6 +943,7 @@ def main():
     LOG["plates"] = plate_log
     LOG["plate_rejects"] = REJECT[:30]
     LOG["raqm"] = RAQM
+    LOG["plates_mode"] = PLATES
     for si, f in stills.items():
         cv2.imwrite(os.path.join(OUT, f"still_{si:02d}.jpg"), cv2.resize(f, (360, 640)), [cv2.IMWRITE_JPEG_QUALITY, 85])
 
