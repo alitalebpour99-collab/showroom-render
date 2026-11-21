@@ -18,7 +18,9 @@ import sys
 import cv2
 import librosa
 import numpy as np
-from PIL import Image, ImageDraw, ImageFilter, ImageFont
+from PIL import Image, ImageDraw, ImageFilter, ImageFont, features
+
+RAQM = features.check("raqm")
 
 import arabic_reshaper
 from bidi.algorithm import get_display
@@ -43,7 +45,8 @@ LOG = {}
 
 
 def fa(s):
-    return get_display(arabic_reshaper.reshape(s))
+    # Pillow built with libraqm shapes + reorders Persian itself; only fall back to manual reshaping without it
+    return s if RAQM else get_display(arabic_reshaper.reshape(s))
 
 
 def font(name, size):
@@ -269,6 +272,7 @@ def punch(f, k, n=5, amt=0.045):
 
 # ----------------------------------------------------------------- plates
 _det = None
+REJECT = []
 
 
 def detector():
@@ -284,9 +288,12 @@ def detect(frames):
     for f in frames:
         boxes = []
         for d in detector().predict(f):
-            if d.confidence < 0.30:
-                continue
             b = d.bounding_box
+            bw, bh = b.x2 - b.x1, b.y2 - b.y1
+            ar = bw / max(1, bh)
+            if d.confidence < 0.45 or not (1.6 <= ar <= 7.5) or bw < 24:
+                REJECT.append(dict(conf=round(float(d.confidence), 2), ar=round(ar, 2), w=int(bw)))
+                continue
             boxes.append((b.x1, b.y1, b.x2, b.y2, float(d.confidence)))
         res.append(boxes)
     return res
@@ -404,7 +411,7 @@ def label_layer(text):
     im = Image.new("RGBA", (W, H), (0, 0, 0, 0))
     d = ImageDraw.Draw(im)
     f = font("Light", 40)
-    x0, y0 = 84, int(H * 0.69)
+    x0, y0 = 84, int(H * 0.165)
     d.line([(x0, y0 - 22), (x0 + 70, y0 - 22)], fill=GOLD + (255,), width=3)
     sh = Image.new("RGBA", (W, H), (0, 0, 0, 0))
     ds = ImageDraw.Draw(sh)
@@ -429,7 +436,7 @@ def watermark_layer():
 def badge_layer():
     im = Image.new("RGBA", (W, H), (0, 0, 0, 0))
     d = ImageDraw.Draw(im)
-    x0, y0, bw, bh = 84, 210, 470, 74
+    x0, y0, bw, bh = 84, int(H * 0.72), 470, 74
     d.rounded_rectangle([x0, y0, x0 + bw, y0 + bh], radius=37, fill=(14, 12, 10, 170), outline=GOLD + (230,), width=2)
     # heart
     cx, cy = x0 + 42, y0 + bh // 2
@@ -588,6 +595,7 @@ def main():
         dets = detect(frames)
         boxes, kept = track(dets, n)
         plate_log.append(dict(shot=si, src=p["src"], frames=n, detected_frames=sum(1 for d in dets if d),
+                              sample=[list(map(lambda v: round(v, 2), b)) for d in dets[:1] for b in d],
                               tracks=kept, covered_frames=sum(1 for b in boxes if b)))
         is_end = p["group"] == "end"
         gpt = None
@@ -629,6 +637,8 @@ def main():
     enc.stdin.close()
     enc.wait()
     LOG["plates"] = plate_log
+    LOG["plate_rejects"] = REJECT[:40]
+    LOG["raqm"] = RAQM
     LOG["frames"] = written
 
     # stills for review
