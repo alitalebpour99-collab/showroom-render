@@ -2,12 +2,12 @@ name: reels
 on:
   workflow_dispatch:
   push:
-    paths: ["tools/**", ".github/workflows/detail-demo.yml"]
+    paths: ["tools/**", "inputs/**", ".github/workflows/**"]
 concurrency: { group: reels, cancel-in-progress: true }
 jobs:
   render:
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 40
     strategy:
       fail-fast: false
       matrix: { template: [detail, send, versus] }
@@ -28,9 +28,13 @@ jobs:
         run: |
           mkdir -p work/in
           openssl enc -d -aes-256-cbc -pbkdf2 -pass env:BUNDLE_KEY -in inputs/bundle.enc | tar xz -C work/in
+          # owned Setavaz tracks made for the page + music/showroom.json (track, drop hint, bpm per template)
+          if [ -f inputs/music.enc ]; then openssl enc -d -aes-256-cbc -pbkdf2 -pass env:BUNDLE_KEY -in inputs/music.enc | tar xz -C work/in; fi
       - name: House LUT
         run: python tools/make_lut.py work/golden-gallery.cube
       - name: Render ${{ matrix.template }}
         run: python tools/render.py work ${{ matrix.template }}
+      - name: Beat and cut check (independent of the plan)
+        run: python tools/sync_check.py work/out/${{ matrix.template }}/taleb-pour-${{ matrix.template }}.mp4 work/out/${{ matrix.template }}/render-log-${{ matrix.template }}.json work/out/${{ matrix.template }}
       - uses: actions/upload-artifact@v4
         with: { name: "${{ matrix.template }}", path: "work/out/${{ matrix.template }}", retention-days: 14 }
