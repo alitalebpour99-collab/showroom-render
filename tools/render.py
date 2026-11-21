@@ -475,7 +475,9 @@ def warp_plate(out, box, src):
     m = plate_slope(src, box)
     cxm, cym = (x1 + x2) / 2, (y1 + y2) / 2
     hw = bw * 0.56
-    hh = bw / PLATE_AR * 0.62
+    bh = y2 - y1
+    # foreshortened plate: its vertical side is the box height minus the slope rise
+    hh = min(bh / 2, max(bw / PLATE_AR * 0.62, (bh - abs(m) * bw) / 2 * 1.08))
     pts = np.float32([[cxm - hw, cym - m * hw - hh], [cxm + hw, cym + m * hw - hh],
                       [cxm + hw, cym + m * hw + hh], [cxm - hw, cym - m * hw + hh]])
     ah, aw = PLATE_ART.shape[:2]
@@ -510,7 +512,7 @@ def put_plates(f, boxes, edges_y=()):
         edge_box = x1 <= 4 or x2 >= w - 4
         if not edge_box and bw / max(1, bh) < 1.6:
             # angled plate: soften the whole plate area, then a correctly proportioned plate across its width
-            bx1, by1, bx2, by2 = max(0, x1 - 6), max(0, y1 - 6), min(w, x2 + 6), min(h, y2 + 6)
+            bx1, by1, bx2, by2 = max(0, x1 - 2), max(0, y1 - 2), min(w, x2 + 2), min(h, y2 + 2)
             for e in edges_y:
                 if by1 < e <= y1:
                     by1 = e
