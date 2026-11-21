@@ -21,6 +21,9 @@ import cv2
 import librosa
 import numpy as np
 import soundfile as sf
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import beatgrid  # noqa: E402
 from PIL import Image, ImageDraw, ImageFilter, ImageFont, features
 
 import arabic_reshaper
@@ -28,9 +31,8 @@ from bidi.algorithm import get_display
 
 RAQM = features.check("raqm")
 W, H, FPS = 1080, 1920, 30
-TOTAL = 10.0
-END_LEN = 1.5
-MONTAGE_END = TOTAL - END_LEN
+TOTAL = 10.0  # set from the bar grid of the track in main()
+MONTAGE_END = 8.5  # start of the end card = the last downbeat
 ROOT = sys.argv[1] if len(sys.argv) > 1 else "work"
 TEMPLATE = sys.argv[2] if len(sys.argv) > 2 else "detail"
 IN = os.path.join(ROOT, "in")
@@ -94,91 +96,42 @@ SHOTS = {
 }
 
 
-# ============================================================ music
+# ============================================================ music + beat grid
+# Every Reel is built on the bar grid of its own track (since 21 Nov 2026):
+#   - music/showroom.json names the track per template (+ optional drop hint, bpm hint);
+#   - tempo and phase come from a comb fit of the kick band around the drop (tools/beatgrid.py), so every cut sits on
+#     an exact beat time (librosa beat_track quantises tempo, and generated tracks are not at the tempo they were asked);
+#   - the drop = the beat where the low end (< 150 Hz) jumps most (bars after vs bars before), snapped near the hint;
+#     downbeats are counted from the drop, so bar lines are musical;
+#   - the window starts DROP_BAR bars before the drop and lasts BARS whole bars: the reveal hits the drop, the end
+#     card owns the last bar, and the loop restarts on a downbeat.
+def load_music_cfg():
+    p = os.path.join(IN, "music", "showroom.json")
+    if os.path.exists(p):
+        with open(p, encoding="utf-8") as fh:
+            return json.load(fh)
+    return {}
+
+
+def beat_grid(path, bpm_hint=None, drop_hint=None, drop_bar=2, bars=5):
+    """bar grid of the track (tools/beatgrid.py: kick-band comb fit around the drop, not librosa's quantised tempo)."""
+    y, sr = librosa.load(path, sr=beatgrid.SRA, mono=True)
+    rel, info = beatgrid.grid_for(y.astype(np.float64), sr, bpm_hint, drop_hint, drop_bar, bars)
+    info = {k: (float(v) if isinstance(v, (np.floating,)) else v) for k, v in info.items()}
+    info["file"] = os.path.basename(path)
+    if info["contrast"] < 3.5:
+        print("WARNING: weak beat grid (contrast %.2f); give a bpm and drop hint in showroom.json" % info["contrast"])
+    print("music", info)
+    return info, rel
+
+
 def music_candidates():
-    cands = []
-    for f in sorted(os.listdir(os.path.join(IN, "music"))):
-        if not f.endswith((".mp3", ".flac", ".wav")):
-            continue
-        y, sr = librosa.load(os.path.join(IN, "music", f), sr=22050, mono=True)
-        dur = len(y) / sr
-        env = librosa.onset.onset_strength(y=y, sr=sr)
-        tempo, beats = librosa.beat.beat_track(onset_envelope=env, sr=sr)
-        tempo = float(np.atleast_1d(tempo)[0])
-        bt = librosa.frames_to_time(beats, sr=sr)
-        if len(bt) < 20:
-            continue
-        pulse = float(env[beats].mean() / (env.mean() + 1e-6))
-        rms = librosa.feature.rms(y=y)[0]
-        rt = librosa.frames_to_time(np.arange(len(rms)), sr=sr)
-        envn = env / (env.max() + 1e-6)
-        best = None
-        for k, tb in enumerate(bt):
-            s = tb - MONTAGE_END  # end card lands on this beat
-            if s < 4 or s + TOTAL + 0.3 > dur:
-                continue
-            m = (rt >= s) & (rt < s + TOTAL)
-            e = float(rms[m].mean())
-            hit = float(envn[beats[k]])
-            sc = e * (0.6 + hit)
-            if best is None or sc > best[0]:
-                best = (sc, s, k, hit, e)
-        if best is None:
-            continue
-        eff = tempo if 95 <= tempo <= 160 else (tempo * 2 if tempo < 95 else tempo / 2)
-        score = pulse * best[0] * (1.0 if 100 <= eff <= 140 else 0.8)
-        s = best[1]
-        rel = [float(t - s) for t in bt if s + 0.05 < t < s + MONTAGE_END - 0.05]
-        info = dict(file=f, tempo=round(tempo, 1), start=round(float(s), 3), end_hit=round(best[3], 2),
-                    energy=round(best[4], 4), score=round(score, 4))
-        print("music cand", info)
-        cands.append((score, info, rel))
-    cands.sort(key=lambda c: -c[0])
-    return cands
+    """fallback for tracks without a showroom.json entry: old window search, then the grid around its best drop."""
+    files = [f for f in sorted(os.listdir(os.path.join(IN, "music"))) if f.endswith((".mp3", ".flac", ".wav"))]
+    return files
 
 
-def make_grid(beats):
-    period = float(np.median(np.diff(beats))) if len(beats) > 2 else 0.5
-    step = 1 if period >= 0.36 else 2
-    g = [0.0] + list(beats[::step]) + [MONTAGE_END]
-    # drop points too close to each other
-    out = [g[0]]
-    for t in g[1:]:
-        if t - out[-1] >= 0.3:
-            out.append(t)
-        else:
-            out[-1] = t if t == MONTAGE_END else out[-1]
-    if out[-1] != MONTAGE_END:
-        out.append(MONTAGE_END)
-    LOG["beat_period"] = round(period, 3)
-    LOG["unit"] = round(period * step, 3)
-    return out
-
-
-def allocate(specs, grid):
-    """specs: list of dict(seg, units). The last spec always runs to MONTAGE_END."""
-    plan = []
-    gi = 0
-    last_i = len(grid) - 1
-    for n, sp in enumerate(specs):
-        is_last = n == len(specs) - 1
-        u = sp["units"]
-        if is_last:
-            j = last_i
-        else:
-            j = gi + u
-            # leave at least 2 grid units for the final segment
-            if j > last_i - 2:
-                continue
-        plan.append(dict(sp["seg"], t0=grid[gi], t1=grid[j]))
-        gi = j
-        if gi >= last_i:
-            break
-    plan.append(dict(SHOTS["end"], kind="end", t0=MONTAGE_END, t1=TOTAL))
-    return plan
-
-
-# ============================================================ templates
+# ============================================================ templates (all in beats)
 def seg(name, **kw):
     d = dict(SHOTS[name])
     d.update(kind="shot", name=name)
@@ -188,31 +141,82 @@ def seg(name, **kw):
 
 SEND_LINES = ["بفرست برای رفیقی که", "همیشه میگه", "«یه روز بنز می‌خرم»"]
 
+# Each template: BARS whole bars (the last one is the end card), DROP_BAR = bar where the reveal starts.
+# Spec = (segment, beats, transition into it). Beats may be halves (eighth notes). Transitions:
+#   cut   hard cut + zoom punch on the beat     whip  motion-blur slide across the beat (+ whoosh ending on it)
+#   flash gold-white flash + impact (the drop)
+TEMPLATES = {
+    "detail": dict(bars=5, drop_bar=2),
+    "send": dict(bars=6, drop_bar=1),
+    "versus": dict(bars=6, drop_bar=1),
+}
+
 
 def template_specs():
     if TEMPLATE == "detail":
-        names = [("c300_grille", 4), ("g80_badge", 2), ("g80_light", 2), ("g80_script", 1), ("g80_wheel", 1),
-                 ("g80_seat", 2), ("g80_console", 2), ("kia_wheel", 1), ("hy_wheel", 1), ("c300_rear", 2),
-                 ("amg_rear", 2), ("newc_hero", 4)]
-        return [dict(seg=seg(n), units=u) for n, u in names]
+        # «حدس بزن کدوم ماشینه؟»: G80 details on the build without a name, the whole car on the drop.
+        pre = [("g80_seat", 2, "cut"), ("g80_console", 2, "cut"), ("g80_wheel", 1, "cut"),
+               ("g80_light", 1, "whip"), ("g80_badge", 1, "cut"), ("g80_script", 1, "whip")]
+        post = [("g80_sign", 4, "flash"), ("g80_front", 2, "whip"), ("g80_rear34", 1, "cut"), ("g80_rear", 1, "cut")]
+        out = [dict(seg=seg(n, label=None, sweep=False), beats=b, tr=t) for n, b, t in pre]
+        out[0]["seg"]["hook"] = "حدس بزن کدوم ماشینه؟"
+        for k, (n, b, t) in enumerate(post):
+            sg = seg(n)
+            if k == 0:
+                sg.update(sweep=True, ramp=True, reveal="جنسیس G80")
+            out.append(dict(seg=sg, beats=b, tr=t))
+        return out
     if TEMPLATE == "send":
-        card = dict(kind="card", group="card", t0=0, t1=0, lines=SEND_LINES)
-        names = [("c300_grille", 3), ("c300_rear", 2), ("eclass_front", 1), ("amg_rear", 2), ("newc_wheel", 1),
-                 ("newc_sign", 2), ("newc_hero", 4)]
-        return [dict(seg=card, units=3)] + [dict(seg=seg(n), units=u) for n, u in names]
+        card = dict(kind="card", group="card", lines=SEND_LINES, name="card")
+        names = [("newc_hero", 4, "flash"), ("newc_wheel", 1, "whip"), ("c300_grille", 3, "cut"), ("amg_rear", 2, "whip"),
+                 ("eclass_front", 2, "cut"), ("c300_rear", 2, "whip"), ("newc_sign", 2, "cut")]
+        out = [dict(seg=card, beats=4, tr="cut")]
+        for k, (n, b, t) in enumerate(names):
+            sg = seg(n)
+            if k == 0:
+                sg.update(sweep=True, ramp=True)
+            out.append(dict(seg=sg, beats=b, tr=t))
+        return out
     if TEMPLATE == "versus":
         rounds = [
-            ("جلو", "c300_front_sign", "g80_sign", 5),
-            ("جلوپنجره", "c300_grille", "g80_badge", 4),
-            ("عقب", "c300_rear_a", "g80_rear", 4),
+            (None, "c300_front_sign", "g80_sign", "cut", dict(title=True)),
+            ("جلو", "c300_grille", "g80_front", "flash", {}),
+            ("عقب", "c300_rear_a", "g80_rear", "whip", {}),
+            ("سه‌رخ", "c300_rear_b", "g80_rear34", "whip", {}),
+            (None, "c300_front_sign", "g80_badge", "flash", dict(ask=True)),
         ]
-        specs = []
-        for i, (r, a, b, u) in enumerate(rounds):
-            specs.append(dict(seg=dict(kind="split", group="vs", top=seg(a), bot=seg(b), round=r, title=(i == 0)), units=u))
-        specs.append(dict(seg=dict(kind="split", group="vs", top=seg("c300_rear_b"), bot=seg("g80_rear34"),
-                                   round=None, ask=True), units=3))
-        return specs
+        out = []
+        for r, a, b, t, extra in rounds:
+            sg = dict(kind="split", group="vs", top=seg(a), bot=seg(b), round=r, name=f"{a}|{b}")
+            sg.update(extra)
+            out.append(dict(seg=sg, beats=4, tr=t))
+        return out
     raise SystemExit("unknown template " + TEMPLATE)
+
+
+def allocate(specs, grid, drop_bar):
+    """grid = beat times of the window (bars*4 + 1 values, from 0). Cuts land on beats (or exact half beats)."""
+    def at(b):
+        k = int(math.floor(b))
+        if k >= len(grid) - 1:
+            return grid[-1]
+        return grid[k] + (b - k) * (grid[k + 1] - grid[k])
+
+    plan, b = [], 0.0
+    montage_beats = len(grid) - 1 - 4
+    total = sum(s["beats"] for s in specs)
+    if abs(total - montage_beats) > 1e-6:
+        raise SystemExit(f"{TEMPLATE}: specs fill {total} beats, the montage has {montage_beats}")
+    for sp in specs:
+        p = dict(sp["seg"], t0=at(b), t1=at(b + sp["beats"]), tr=sp["tr"], beat0=b)
+        plan.append(p)
+        b += sp["beats"]
+    reveal = [p for p in plan if abs(p["beat0"] - drop_bar * 4) < 1e-6]
+    if not reveal:
+        raise SystemExit(f"{TEMPLATE}: no segment starts on the drop (beat {drop_bar * 4})")
+    reveal[0]["drop"] = True
+    plan.append(dict(SHOTS["end"], kind="end", name="end", t0=grid[-5], t1=grid[-1], tr="cut", beat0=b))
+    return plan
 
 
 # ============================================================ video io
@@ -677,7 +681,7 @@ def split_layers():
 
     def tag(text, y):
         t = Image.fromarray(np.zeros((H, W, 4), np.uint8), "RGBA")
-        t = Image.alpha_composite(t, soft_band(0, y - 24, 760, 100, 160))
+        t = Image.alpha_composite(t, soft_band(0, y - 30, 1000, 112, 200))
         dd = ImageDraw.Draw(t)
         spaced(dd, (60, y), text, font("Light", 38), IVORY + (255,), 6)
         return np.array(t)
@@ -800,25 +804,73 @@ def crop_half(f, cy):
     return f[y0:y0 + hh]
 
 
+def whip(f, u, direction=1):
+    """motion-blur slide: u in [0, 1] = strength (1 = at the cut)."""
+    if u <= 0.02:
+        return f
+    sh = int(direction * u * W * 0.22)
+    M = np.float32([[1, 0, sh], [0, 1, 0]])
+    g = cv2.warpAffine(f, M, (W, H), borderMode=cv2.BORDER_REPLICATE)
+    L = max(3, int(90 * u)) | 1
+    return cv2.blur(g, (L, 1))
+
+
+def flash(f, k, n=5):
+    if k >= n:
+        return f
+    a = 0.85 * (1 - k / n) ** 1.5
+    col = np.array([214, 238, 255], np.float32)  # warm white (BGR)
+    return np.clip(f.astype(np.float32) * (1 - a) + col * a, 0, 255).astype(np.uint8)
+
+
+def lowpass_close(x, u_from=0.0, u_to=0.85, fc=1200):
+    """the last bar closes like a filter (dry -> low passed), so the loop back to the build sounds like a turnaround."""
+    from scipy.signal import butter, sosfiltfilt
+    sos = butter(4, fc, btype="low", fs=SR, output="sos")
+    lpx = sosfiltfilt(sos, x, axis=-1)
+    u = np.linspace(u_from, u_to, x.shape[-1]) ** 1.3
+    return x * (1 - u) + lpx * u
+
+
 def main():
-    cands = music_candidates()
-    pick = {"detail": 0, "send": 1, "versus": 2}.get(TEMPLATE, 0) % len(cands)
-    _, minfo, beats = cands[pick]
+    global TOTAL, MONTAGE_END
+    cfg = load_music_cfg()
+    tcfg = dict(TEMPLATES[TEMPLATE])
+    mc = cfg.get(TEMPLATE, {})
+    files = music_candidates()
+    mfile = mc.get("file") or files[{"detail": 0, "send": 1, "versus": 2}.get(TEMPLATE, 0) % len(files)]
+    minfo, grid = beat_grid(os.path.join(IN, "music", mfile), mc.get("bpm"), mc.get("drop"),
+                            tcfg["drop_bar"], tcfg["bars"])
+    minfo["title"] = mc.get("title")
+    TOTAL = grid[-1]
+    MONTAGE_END = grid[-5]
     LOG["music"] = minfo
-    grid = make_grid(np.array(beats))
-    plan = allocate(template_specs(), grid)
-    LOG["cuts"] = [dict(kind=p.get("kind"), name=p.get("name"), t0=round(p["t0"], 3), t1=round(p["t1"], 3)) for p in plan]
+    plan = allocate(template_specs(), grid, tcfg["drop_bar"])
+    drop_t = grid[tcfg["drop_bar"] * 4]
+    beat_frames = sorted(set(int(round(g * FPS)) for g in grid[:-1]))
+    LOG["cuts"] = [dict(kind=p.get("kind"), name=p.get("name"), tr=p.get("tr"), beat=p["beat0"], t0=round(p["t0"], 3),
+                        t1=round(p["t1"], 3), drop=bool(p.get("drop"))) for p in plan]
+    # sync check of the plan itself: every cut vs the nearest beat / eighth, after frame rounding
+    eighths = sorted(set([g for g in grid] + [(a + b) / 2 for a, b in zip(grid[:-1], grid[1:])]))
+    errs = []
+    for p in plan:
+        tf = round(p["t0"] * FPS) / FPS
+        errs.append(round(1000 * min(abs(tf - e) for e in eighths), 1))
+    LOG["sync_plan"] = dict(max_err_ms=max(errs), mean_err_ms=round(float(np.mean(errs)), 1), frame_ms=round(1000 / FPS, 1),
+                            drop_t=round(drop_t, 3), drop_cut=[p["name"] for p in plan if p.get("drop")])
     print(json.dumps(LOG, indent=1, ensure_ascii=False))
 
     wm = watermark_layer()
     badge = badge_layer()
     endl = endcard_layer()
+    bar = grid[4] - grid[0]
+    badge_t0 = grid[-9] if TEMPLATE != "versus" else None  # one bar before the end card
+    badge_t1 = grid[-5] - 0.1 if badge_t0 is not None else None
     labels = {}
     gstart, gdur = {}, {}
-    # label runs: consecutive segments of the same car share one label
     run, prev = -1, None
     for p in plan:
-        g = p.get("group")
+        g = p.get("group") if p.get("label") or p.get("kind") != "shot" else ("nolabel", p["name"])
         if g != prev:
             run += 1
             prev = g
@@ -828,28 +880,33 @@ def main():
             gstart[run] = p["t0"]
         if run not in labels and p.get("label"):
             labels[run] = label_layer(p["label"])
-        if g not in gstart:
-            gstart[g] = p["t0"]
+        if p.get("group") not in gstart:
+            gstart[p.get("group")] = p["t0"]
     split_base, tag_top, tag_bot = split_layers()
+    hook = next((p.get("hook") for p in plan if p.get("hook")), None)
+    hook_l = pill_layer(hook, big=True, y=int(H * 0.30)) if hook else None
 
     enc = subprocess.Popen(["ffmpeg", "-loglevel", "error", "-y", "-f", "rawvideo", "-pix_fmt", "bgr24",
                             "-s", f"{W}x{H}", "-r", str(FPS), "-i", "-", "-c:v", "libx264", "-preset", "slow",
                             "-crf", "17", "-pix_fmt", "yuv420p", os.path.join(OUT, "video.mp4")], stdin=subprocess.PIPE)
     total_frames = int(round(TOTAL * FPS))
     plate_log, sweeps, stills, events = [], [], {}, []
+    first_frame = None
     for si, p in enumerate(plan):
         f0 = int(round(p["t0"] * FPS))
         f1 = total_frames if si == len(plan) - 1 else int(round(p["t1"] * FPS))
         n = f1 - f0
         kind = p.get("kind")
+        nxt_tr = plan[si + 1]["tr"] if si + 1 < len(plan) else None
         edges = ()
         if kind == "card":
             layers, deco = card_layers(p["lines"])
-            per = n / (len(layers) + 0.6)
             nxt = plan[si + 1] if si + 1 < len(plan) else SHOTS["c300_grille"]
             bgsrc = decode(nxt)
+            line_t = [grid[k] for k in range(len(layers))]  # one line per beat
             frames = []
             for k in range(n):
+                t = (f0 + k) / FPS
                 bf = bgsrc[min(len(bgsrc) - 1, k // 3)]
                 bf = cv2.GaussianBlur(cv2.resize(bf, (W // 4, H // 4)), (0, 0), 6)
                 bf = cv2.resize(bf, (W, H), interpolation=cv2.INTER_LINEAR)
@@ -857,12 +914,11 @@ def main():
                 f = comp(f, wm)
                 f = comp(f, deco)
                 for li, L in enumerate(layers):
-                    st = li * per
-                    if k >= st:
-                        f = comp(f, L, min(1.0, (k - st) / 4))
+                    if t >= line_t[li] - 1e-3:
+                        f = comp(f, L, min(1.0, (t - line_t[li]) * FPS / 3 + 0.34))
                 frames.append(f)
-            for li in range(len(layers)):
-                events.append(("tick", p["t0"] + li * per / FPS))
+            for lt in line_t:
+                events.append(("tick", lt))
             boxes = [[] for _ in range(n)]
         elif kind == "split":
             top = render_shot_frames(p["top"], n)
@@ -897,14 +953,21 @@ def main():
         if kind == "split" and p.get("round"):
             rl = pill_layer(p["round"])
         elif kind == "split" and p.get("ask"):
-            rl = pill_layer("تو کدومو برمی‌داری؟ کامنت کن", big=False)
+            rl = pill_layer("تو کدومو برمی‌داری؟", big=True)
         else:
             rl = None
-        if kind == "split":
+        reveal_l = pill_layer(p["reveal"], big=True, y=int(H * 0.30)) if p.get("reveal") else None
+        # transition sounds: whoosh peaks on the cut, impact on flashes
+        if si > 0 and p["tr"] == "whip":
             events.append(("whoosh", p["t0"]))
+        if p["tr"] == "flash":
+            events.append(("impact", p["t0"]))
+        if p.get("drop"):
+            events.append(("riser", p["t0"]))
         for k in range(n):
             f = frames[k]
-            t = (f0 + k) / FPS
+            fi = f0 + k
+            t = fi / FPS
             if kind == "shot" and p.get("sky"):
                 f = sky_filter(f, 0.42)
             if is_end:
@@ -913,18 +976,27 @@ def main():
                 f = light_sweep(f, (t - st) / (0.9 if is_end else 0.75), gpt)
             f = put_plates(f, boxes[k], edges)
             if kind in ("shot", "split"):
-                f = punch(f, k)
+                if k < 5:
+                    f = punch(f, k, amt=0.09 if p["tr"] == "flash" else 0.045)
+                else:  # a small pulse on every beat inside the shot
+                    lb = max(b for b in beat_frames if b <= fi)
+                    if lb > f0:
+                        f = punch(f, fi - lb, n=4, amt=0.018)
+            # whips move the picture only: text and tags are composited after, so they stay sharp
+            if p["tr"] == "whip" and si > 0 and k < 3:
+                f = whip(f, 1 - k / 3, direction=1)
+            if nxt_tr == "whip" and k >= n - 3:
+                f = whip(f, (k - (n - 3) + 1) / 3, direction=-1)
             if is_end:
                 f = comp(f, endl, min(1.0, k / 6))
             elif kind == "split":
                 f = comp(f, split_base)
                 f = comp(f, tag_top, min(1.0, (t - gstart["vs"]) / 0.2))
                 f = comp(f, tag_bot, min(1.0, (t - gstart["vs"]) / 0.2))
-                if rl_title is not None and k < n * 0.5:
-                    f = comp(f, rl_title, min(1.0, k / 4))
+                if rl_title is not None:
+                    f = comp(f, rl_title, 1.0 if k < n - 2 else 0.5)
                 elif rl is not None:
-                    k0 = int(n * 0.5) if rl_title is not None else 0
-                    f = comp(f, rl, min(1.0, (k - k0) / 4))
+                    f = comp(f, rl, min(1.0, (k + 2) / 4))
                 f = comp(f, wm)
             elif kind == "shot":
                 f = comp(f, wm)
@@ -933,8 +1005,21 @@ def main():
                     tg = t - gstart[g]
                     la = min(1.0, tg / 0.2) * min(1.0, (gstart[g] + gdur[g] - t) / 0.15)
                     f = comp(f, labels[g], max(0, la))
-                if TEMPLATE != "versus" and 5.2 <= t <= 7.6:
-                    f = comp(f, badge, min(1.0, (t - 5.2) / 0.2) * min(1.0, (7.6 - t) / 0.2))
+                if hook_l is not None and t < drop_t:
+                    f = comp(f, hook_l, min(1.0, (t + 0.1) / 0.1) * min(1.0, (drop_t - t) / 0.08))
+                if reveal_l is not None and t >= p["t0"] + bar / 4 - 1e-3:
+                    f = comp(f, reveal_l, min(1.0, (t - p["t0"] - bar / 4) / 0.12 + 0.3))
+                if badge_t0 is not None and badge_t0 <= t <= badge_t1:
+                    f = comp(f, badge, min(1.0, (t - badge_t0) / 0.2) * min(1.0, (badge_t1 - t) / 0.2))
+            # the drop's flash lights the whole frame
+            if p["tr"] == "flash":
+                f = flash(f, k)
+            # loop: the end card's last frames dissolve into the opening frame
+            if is_end and first_frame is not None and k >= n - 6:
+                u = (k - (n - 6) + 1) / 6
+                f = cv2.addWeighted(f, 1 - u, first_frame, u, 0)
+            if fi == 0:
+                first_frame = f.copy()
             enc.stdin.write(np.ascontiguousarray(f).tobytes())
             if k == n // 2:
                 stills[si] = f
@@ -947,44 +1032,43 @@ def main():
     for si, f in stills.items():
         cv2.imwrite(os.path.join(OUT, f"still_{si:02d}.jpg"), cv2.resize(f, (360, 640)), [cv2.IMWRITE_JPEG_QUALITY, 85])
 
-    # ---- audio
-    y, _ = librosa.load(os.path.join(IN, "music", minfo["file"]), sr=SR, mono=False, offset=minfo["start"], duration=TOTAL + 0.2)
+    # ---- audio: exactly the window of whole bars; the last bar closes like a filter, then the loop restarts
+    y, _ = librosa.load(os.path.join(IN, "music", mfile), sr=SR, mono=False, offset=minfo["start"], duration=TOTAL + 0.2)
     if y.ndim == 1:
         y = np.stack([y, y])
-    y = y[:, :int(TOTAL * SR)]
-    nS = y.shape[1]
+    nS = int(round(TOTAL * SR))
+    y = y[:, :nS]
+    if y.shape[1] < nS:
+        y = np.pad(y, ((0, 0), (0, nS - y.shape[1])))
+    eb = int(round(MONTAGE_END * SR))
+    y[:, eb:] = lowpass_close(y[:, eb:])
     fade = np.ones(nS)
-    fade[-int(0.6 * SR):] = np.linspace(1, 0, int(0.6 * SR)) ** 1.5
-    fade[:int(0.02 * SR)] = np.linspace(0, 1, int(0.02 * SR))
+    fade[:int(0.005 * SR)] = np.linspace(0, 1, int(0.005 * SR))
+    fade[-int(0.03 * SR):] = np.linspace(1, 0, int(0.03 * SR))
     music = y * fade * 0.8
     fx = np.zeros(nS)
-    duck = np.ones(nS)
     if plan[0].get("kind") == "card":
-        # hook card: music enters softer, full on the reveal
-        rev = plan[1]["t0"]
-        ri = int(rev * SR)
-        duck[:ri] = 0.35
-        duck[ri:ri + int(0.05 * SR)] = np.linspace(0.35, 1, int(0.05 * SR))
-        place(fx, sfx_thud(), rev)
+        music[:, :int(drop_t * SR)] *= 0.7
     else:
-        place(fx, sfx_thud(), 0.0)
-        dn = int(0.35 * SR)
-        duck[:dn] = 0.45 + 0.55 * np.linspace(0, 1, dn) ** 2
-    music = music * duck
-    ramps = [p for p in plan if p.get("kind") == "shot" and p.get("ramp") and p["t0"] > 0.5]
-    for p in ramps:
-        place(fx, sfx_whoosh(0.42), max(0, p["t0"] - 0.36))
+        place(fx, sfx_thud() * 0.8, 0.0)
+    wd = 0.42
     for ev, t in events:
         if ev == "tick":
             place(fx, sfx_tick(), t)
-        elif ev == "whoosh" and t > 0.2:
-            place(fx, sfx_whoosh(0.35) * 0.7, t - 0.28)
+        elif ev == "whoosh":
+            place(fx, sfx_whoosh(wd) * 0.6, max(0, t - 0.65 * wd))
+        elif ev == "impact":
+            place(fx, sfx_impact() * 0.7, t)
+        elif ev == "riser":
+            place(fx, sfx_whoosh(0.8) * 0.8, max(0, t - 0.8 * 0.8))
+            place(fx, sfx_thud() * 0.6, t)
     for st in sweeps:
         place(fx, sfx_shimmer(), st + 0.15)
-    if TEMPLATE != "versus":
-        place(fx, sfx_cue(), 5.2)
+    if badge_t0 is not None:
+        place(fx, sfx_cue(), badge_t0)
     place(fx, sfx_impact() * 0.8, MONTAGE_END)
     place(fx, sfx_thud() * 0.45, MONTAGE_END)
+    fx[-int(0.03 * SR):] *= np.linspace(1, 0, int(0.03 * SR))
     mix = music + fx[None, :] * 0.9
     mix = mix / max(1.0, np.abs(mix).max() / 0.98)
     sf.write(os.path.join(OUT, "audio.wav"), mix.T, SR)
@@ -994,8 +1078,11 @@ def main():
                     os.path.join(OUT, "audio.wav"), "-af", "loudnorm=I=-14:TP=-1.5:LRA=9", "-ar", "48000",
                     "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-shortest", "-movflags", "+faststart", final], check=True)
     subprocess.run(["ffmpeg", "-loglevel", "error", "-y", "-i", final, "-vf",
-                    "fps=1,scale=270:-1,tile=5x2:padding=6:color=black", "-frames:v", "1",
+                    "fps=1,scale=270:-1,tile=6x2:padding=6:color=black", "-frames:v", "1",
                     os.path.join(OUT, f"contact-sheet-{TEMPLATE}-1fps.jpg")], check=True)
+    subprocess.run(["ffmpeg", "-loglevel", "error", "-y", "-i", final, "-vf",
+                    f"fps={10 / TOTAL:.5f},scale=270:-1,tile=5x2:padding=6:color=black", "-frames:v", "1",
+                    os.path.join(OUT, f"frames10-{TEMPLATE}.jpg")], check=True)
     os.remove(os.path.join(OUT, "video.mp4"))
     os.remove(os.path.join(OUT, "audio.wav"))
     with open(os.path.join(OUT, f"render-log-{TEMPLATE}.json"), "w", encoding="utf-8") as fh:
