@@ -291,7 +291,10 @@ def detect(frames):
             b = d.bounding_box
             bw, bh = b.x2 - b.x1, b.y2 - b.y1
             ar = bw / max(1, bh)
-            if d.confidence < 0.45 or not (1.6 <= ar <= 7.5) or bw < 24:
+            # a plate cut by the frame edge looks narrow: allow it only with high confidence
+            edge = b.x1 <= 3 or b.x2 >= W - 3 or b.y2 >= H - 3
+            ok_shape = (1.6 <= ar <= 7.5) or (edge and d.confidence >= 0.85)
+            if d.confidence < 0.45 or not ok_shape or bw < 24:
                 REJECT.append(dict(conf=round(float(d.confidence), 2), ar=round(ar, 2), w=int(bw)))
                 continue
             boxes.append((b.x1, b.y1, b.x2, b.y2, float(d.confidence)))
