@@ -982,6 +982,11 @@ def main():
                     lb = max(b for b in beat_frames if b <= fi)
                     if lb > f0:
                         f = punch(f, fi - lb, n=4, amt=0.018)
+            # whips move the picture only: text and tags are composited after, so they stay sharp
+            if p["tr"] == "whip" and si > 0 and k < 3:
+                f = whip(f, 1 - k / 3, direction=1)
+            if nxt_tr == "whip" and k >= n - 3:
+                f = whip(f, (k - (n - 3) + 1) / 3, direction=-1)
             if is_end:
                 f = comp(f, endl, min(1.0, k / 6))
             elif kind == "split":
@@ -1006,11 +1011,7 @@ def main():
                     f = comp(f, reveal_l, min(1.0, (t - p["t0"] - bar / 4) / 0.12 + 0.3))
                 if badge_t0 is not None and badge_t0 <= t <= badge_t1:
                     f = comp(f, badge, min(1.0, (t - badge_t0) / 0.2) * min(1.0, (badge_t1 - t) / 0.2))
-            # transitions across the cut
-            if p["tr"] == "whip" and si > 0 and k < 3:
-                f = whip(f, 1 - k / 3, direction=1)
-            if nxt_tr == "whip" and k >= n - 3:
-                f = whip(f, (k - (n - 3) + 1) / 3, direction=-1)
+            # the drop's flash lights the whole frame
             if p["tr"] == "flash":
                 f = flash(f, k)
             # loop: the end card's last frames dissolve into the opening frame

@@ -30,9 +30,7 @@ dur = len(y) / sr
 on, hop_s = beatgrid.kick_onsets(y.astype(np.float64), sr)
 bpm0 = 60 / period
 bpm_m, b1, phase, contrast = beatgrid.comb(on, hop_s, 0.0, dur - 0.05, bpm0 * 0.95, bpm0 * 1.05, step=0.01, ph_step=hop_s)
-while phase - b1 > -1e-9:
-    phase -= b1
-phase += b1
+phase = phase % b1  # first beat at or after 0
 beats = np.arange(phase, dur + 1e-6, b1)
 eighths = np.sort(np.concatenate([beats, beats[:-1] + b1 / 2]))
 
